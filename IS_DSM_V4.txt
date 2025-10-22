@@ -1,0 +1,476 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <iostream>
+#include <complex>
+#include <vector>
+#include <cstdlib>
+#include <iomanip>
+#include <algorithm>
+#include <map>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define  OUTPUTFILE  "differential_dsm_v4_complete.txt"
+#define  OPENSTRING  "#Eb/No(dB)        BitErrRate                    BitErrSample           TotalSample \n"
+#define  DATASTRING  "%5.2f             %18.16f             %7d             %11u \n",\
+                     (snrdb),(double)biterrno/dsignal,biterrno,dsignal
+#define  DB0         0
+#define  DBSTEP      5.0
+#define  POINTNO     11
+#define  ERRNOSTEP   100
+#define  MAXERRNO    300
+#define  SAMPLE_NUM  50000
+
+// Differential DSM system parameters
+#define  NT          4      // Number of transmit antennas
+#define  NR          1      // Number of receive antennas
+#define  NT_FACTORIAL 24    // 4! = 24 total antenna permutations
+#define  L_VALUE     16     // 2^floor(log2(24)) = 2^4 = 16
+
+// Improved scheme parameters
+#define  IMPROVED_ROWS    24    // 3L/2 = 24 rows (A₀ to A₂₃)
+#define  IMPROVED_COLS    24    // 3L/2 = 24 columns (A₀ to A₂₃)
+#define  DSM_BITS         9     // 9 bits for differential encoding
+#define  QPSK_BITS        2     // 2 bits for QPSK modulation
+#define  BITS_PER_SYMBOL  (DSM_BITS + QPSK_BITS) // 9 + 2 = 11 bits total
+
+using namespace std;
+
+FILE* fp;
+static char  filename[80] = OUTPUTFILE;
+int    point, biterrno, errlevel, dsignal, samp;
+double snrdb, snr, deviate;
+
+// DSM specific variables
+vector<vector<int>> antenna_matrices;        // All 24 permutation matrices A₀ to A₂₃
+map<pair<int, int>, string> differential_table; // Differential encoding table
+map<string, pair<int, int>> reverse_table;      // Reverse lookup table
+
+// Differential detection variables (for receiver)
+static complex<double> prev_rx_signal(0.0, 0.0);
+static bool is_first_symbol = true;
+
+// ===== NEW: Differential encoding state (for transmitter) =====
+// Forward declaration of initialize_identity_matrix
+vector<vector<complex<double>>> initialize_identity_matrix(int n);
+static vector<vector<complex<double>>> S_prev = initialize_identity_matrix(NT);  // S(0) = I
+
+int transmitted_bits[12];  // Max bits needed (11 + buffer)
+int detected_bits[12];
+
+double drand48()
+{
+    double w;
+    w = (double)rand() / RAND_MAX;
+    return w;
+}
+
+// ========== Matrix Operation Functions ==========
+
+// Initialize identity matrix I (n×n)
+vector<vector<complex<double>>> initialize_identity_matrix(int n)
+{
+    vector<vector<complex<double>>> I(n, vector<complex<double>>(n, 0.0));
+    for (int i = 0; i < n; i++) {
+        I[i][i] = complex<double>(1.0, 0.0);
+    }
+    return I;
+}
+
+// Build X(t) = qpsk_symbol × A(t) matrix (simplified version)
+vector<vector<complex<double>>> build_X_matrix(int matrix_idx, complex<double> symbol)
+{
+    vector<vector<complex<double>>> X(NT, vector<complex<double>>(NT, 0.0));
+    
+    // Get antenna pattern from antenna_matrices
+    vector<int> pattern = antenna_matrices[matrix_idx];
+    
+    // For each time slot (column)
+    for (int col = 0; col < NT; col++) {
+        int row = pattern[col];  // Which antenna is activated
+        X[row][col] = symbol;    // Place symbol at activated position
+    }
+    
+    return X;
+}
+
+// Matrix multiplication: C = A × B
+vector<vector<complex<double>>> matrix_multiply(
+    const vector<vector<complex<double>>>& A,
+    const vector<vector<complex<double>>>& B)
+{
+    int n = A.size();
+    vector<vector<complex<double>>> C(n, vector<complex<double>>(n, 0.0));
+    
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            for (int k = 0; k < n; k++) {
+                C[i][j] += A[i][k] * B[k][j];
+            }
+        }
+    }
+    
+    return C;
+}
+
+// Print matrix (for debugging)
+void print_matrix(const vector<vector<complex<double>>>& M, const string& name)
+{
+    printf("%s (%dx%d):\n", name.c_str(), (int)M.size(), (int)M[0].size());
+    for (int i = 0; i < M.size(); i++) {
+        for (int j = 0; j < M[0].size(); j++) {
+            printf("(%6.3f,%6.3f) ", real(M[i][j]), imag(M[i][j]));
+        }
+        printf("\n");
+    }
+    printf("\n");
+}
+
+// Convert integer to 9-bit binary string
+string int_to_9bit(int value)
+{
+    string bit_pattern = "";
+    for (int bit = DSM_BITS - 1; bit >= 0; bit--) {
+        bit_pattern += ((value >> bit) & 1) ? '1' : '0';
+    }
+    return bit_pattern;
+}
+
+void initial()
+{
+    if ((fp = fopen(filename, "a")) == NULL)
+    {
+        printf("\nOpen file error!\n");
+        exit(1);
+    }
+    else {
+        fprintf(fp, OPENSTRING);
+        fclose(fp);
+        printf("\n========================================================\n");
+        printf("  Differential DSM v4 - Complete Matrix Implementation\n");
+        printf("========================================================\n\n");
+        printf("System Configuration:\n");
+        printf("  Nt = %d (Transmit antennas)\n", NT);
+        printf("  Nr = %d (Receive antennas)\n", NR);
+        printf("  Total antenna matrices: %d (A₀ to A₂₃)\n", NT_FACTORIAL);
+        printf("\nMatrix Implementation:\n");
+        printf("  ✓ S(t) = S(t-1) × X(t)  [Differential encoding]\n");
+        printf("  ✓ X(t) = qpsk_symbol × A(t)  [Data matrix]\n");
+        printf("  ✓ Y(t) = H(t) × S(t) + N(t)  [Reception]\n");
+        printf("  ✓ S(0) = I  [Identity matrix initialization]\n");
+        printf("\nImproved Scheme:\n");
+        printf("  Table: %d × %d (3L/2 × 3L/2)\n", IMPROVED_ROWS, IMPROVED_COLS);
+        printf("  Encoding: Sequential ID (0-511)\n");
+        printf("  Efficiency: 512/512 = 100%%\n");
+        printf("\nData Rate:\n");
+        printf("  Bits per symbol: %d (%d DSM + %d QPSK)\n", BITS_PER_SYMBOL, DSM_BITS, QPSK_BITS);
+        printf("========================================================\n\n");
+    }
+}
+
+double normal()
+{
+    static int iset = 0;
+    static double gset;
+    double fac, r, v1, v2;
+
+    if (iset == 0) {
+        do {
+            v1 = 2.0 * drand48() - 1.0;
+            v2 = 2.0 * drand48() - 1.0;
+            r = v1 * v1 + v2 * v2;
+        } while (r >= 1.0 || r == 0.0);
+
+        fac = sqrt(-2.0 * log(r) / r);
+        gset = v1 * fac;
+        iset = 1;
+        return(v2 * fac);
+    }
+    else {
+        iset = 0;
+        return gset;
+    }
+}
+
+void record()
+{
+    fp = fopen(filename, "a");
+    fprintf(fp, DATASTRING);
+    fclose(fp);
+}
+
+// Generate all 24 antenna permutation matrices using next_permutation
+void generate_antenna_matrices()
+{
+    antenna_matrices.clear();
+    vector<int> base = { 0, 1, 2, 3 }; // Start from A₀ = [0,1,2,3]
+
+    printf("Generating all antenna matrices:\n");
+
+    int count = 0;
+    do {
+        antenna_matrices.push_back(base);
+
+        if (count < 6 || count >= 20) {
+            printf("A%-2d: [", count);
+            for (int j = 0; j < NT; j++) {
+                printf("%d", base[j]);
+                if (j < NT - 1) printf(", ");
+            }
+            printf("]\n");
+        }
+        else if (count == 6) {
+            printf("...\n");
+        }
+
+        count++;
+    } while (next_permutation(base.begin(), base.end()));
+
+    printf("\nTotal: %d matrices\n\n", (int)antenna_matrices.size());
+}
+
+// Generate improved differential encoding table using sequential ID
+void initialize_improved_differential_table()
+{
+    differential_table.clear();
+    reverse_table.clear();
+
+    printf("Generating Improved Differential Table (Sequential ID):\n\n");
+
+    int entry_id = 0;
+
+    // Region 1: A(t-1) ∈ [0,15], A(t) ∈ [0,23]
+    printf("Region 1: A(t-1)∈[0,15] × A(t)∈[0,23] (ID 0-383)\n");
+    for (int prev_idx = 0; prev_idx < L_VALUE; prev_idx++) {
+        for (int curr_idx = 0; curr_idx < NT_FACTORIAL; curr_idx++) {
+            string bit_pattern = int_to_9bit(entry_id);
+            differential_table[{prev_idx, curr_idx}] = bit_pattern;
+            reverse_table[bit_pattern] = {prev_idx, curr_idx};
+            
+            if (entry_id < 4 || entry_id == 383) {
+                printf("  ID %3d: (%2d,%2d) → %s\n", entry_id, prev_idx, curr_idx, bit_pattern.c_str());
+            } else if (entry_id == 4) {
+                printf("  ...\n");
+            }
+            entry_id++;
+        }
+    }
+
+    // Region 2: A(t-1) ∈ [16,23], A(t) ∈ [0,15]
+    printf("\nRegion 2: A(t-1)∈[16,23] × A(t)∈[0,15] (ID 384-511)\n");
+    for (int prev_idx = L_VALUE; prev_idx < IMPROVED_ROWS; prev_idx++) {
+        for (int curr_idx = 0; curr_idx < L_VALUE; curr_idx++) {
+            string bit_pattern = int_to_9bit(entry_id);
+            differential_table[{prev_idx, curr_idx}] = bit_pattern;
+            reverse_table[bit_pattern] = {prev_idx, curr_idx};
+            
+            if (entry_id < 388 || entry_id == 511) {
+                printf("  ID %3d: (%2d,%2d) → %s\n", entry_id, prev_idx, curr_idx, bit_pattern.c_str());
+            } else if (entry_id == 388) {
+                printf("  ...\n");
+            }
+            entry_id++;
+        }
+    }
+
+    printf("\nTotal entries: %d (100%% efficiency)\n\n", entry_id);
+}
+
+// QPSK modulation
+complex<double> qpsk_modulate(int bit1, int bit2)
+{
+    double norm_factor = 1.0 / sqrt(2.0);
+
+    if (bit1 == 0 && bit2 == 0) return complex<double>(norm_factor, norm_factor);
+    if (bit1 == 0 && bit2 == 1) return complex<double>(-norm_factor, norm_factor);
+    if (bit1 == 1 && bit2 == 1) return complex<double>(-norm_factor, -norm_factor);
+    if (bit1 == 1 && bit2 == 0) return complex<double>(norm_factor, -norm_factor);
+
+    return complex<double>(norm_factor, norm_factor);
+}
+
+// QPSK demodulation
+pair<int, int> qpsk_demodulate(complex<double> received_symbol)
+{
+    double real_part = real(received_symbol);
+    double imag_part = imag(received_symbol);
+
+    int bit1 = (real_part < 0) ? 1 : 0;
+    int bit2 = (imag_part < 0) ? 0 : 1;
+
+    return make_pair(bit1, bit2);
+}
+
+void differential_dsm_qpsk_transmit_receive()
+{
+    // ========== Step 1: Generate information bits ==========
+    for (int i = 0; i < BITS_PER_SYMBOL; i++) {
+        transmitted_bits[i] = rand() % 2;
+    }
+
+    // Separate DSM bits and QPSK bits
+    int dsm_bits[DSM_BITS];
+    int qpsk_bits[QPSK_BITS];
+
+    for (int i = 0; i < DSM_BITS; i++) {
+        dsm_bits[i] = transmitted_bits[i];
+    }
+    for (int i = 0; i < QPSK_BITS; i++) {
+        qpsk_bits[i] = transmitted_bits[DSM_BITS + i];
+    }
+
+    // Convert DSM bits to string
+    string tx_dsm_string = "";
+    for (int i = 0; i < DSM_BITS; i++) {
+        tx_dsm_string += (dsm_bits[i] == 1) ? '1' : '0';
+    }
+
+    // ========== Step 2: Find antenna matrix indices ==========
+    auto it = reverse_table.find(tx_dsm_string);
+    if (it == reverse_table.end()) {
+        it = reverse_table.begin();
+    }
+
+    int prev_matrix_idx = it->second.first;   // A(t-1) index
+    int curr_matrix_idx = it->second.second;  // A(t) index
+
+    // ========== Step 3: Generate QPSK symbol ==========
+    complex<double> qpsk_symbol = qpsk_modulate(qpsk_bits[0], qpsk_bits[1]);
+
+    // ========== Step 4: Build X(t) = qpsk_symbol × A(t) ==========
+    vector<vector<complex<double>>> X_t = build_X_matrix(curr_matrix_idx, qpsk_symbol);
+
+    // ========== Step 5: Differential encoding S(t) = S(t-1) × X(t) ==========
+    vector<vector<complex<double>>> S_t = matrix_multiply(S_prev, X_t);
+
+    // ========== Step 6: Generate channel H(t) (NR × NT) ==========
+    vector<complex<double>> h(NT);
+    for (int i = 0; i < NT; i++) {
+        h[i] = complex<double>(normal(), normal());
+    }
+
+    // ========== Step 7: Generate noise N(t) (NR × NT vector) ==========
+    vector<complex<double>> noise(NT);
+    for (int k = 0; k < NT; k++) {
+        noise[k] = complex<double>(deviate * normal(), deviate * normal());
+    }
+
+    // ========== Step 8: Calculate Y(t) = H(t) × S(t) + N(t) ==========
+    // Y(t) is NR × NT vector (1×4 in this case)
+    vector<complex<double>> Y_t(NT, 0.0);
+    
+    for (int k = 0; k < NT; k++) {  // For each time slot
+        for (int i = 0; i < NT; i++) {  // Sum over all antennas
+            Y_t[k] += h[i] * S_t[i][k];
+        }
+        Y_t[k] += noise[k];  // Add noise
+    }
+
+    // ========== Step 9: Update S(t-1) for next block ==========
+    S_prev = S_t;
+
+    // ========== Step 10: Differential detection (placeholder) ==========
+    // For now, use simplified detection
+    // TODO: Implement proper differential ML detection
+    
+    if (is_first_symbol) {
+        prev_rx_signal = Y_t[0];  // Use first time slot as reference
+        is_first_symbol = false;
+        return;
+    }
+
+    // Simplified detection: use only first time slot
+    double min_distance = 1e10;
+    string detected_dsm_str = "000000000";
+    pair<int, int> detected_qpsk_bits = make_pair(0, 0);
+
+    for (auto& table_entry : differential_table) {
+        for (int q1 = 0; q1 <= 1; q1++) {
+            for (int q2 = 0; q2 <= 1; q2++) {
+                complex<double> test_qpsk = qpsk_modulate(q1, q2);
+                
+                // Simplified: assume first time slot comparison
+                complex<double> predicted = prev_rx_signal * test_qpsk;
+                double distance = norm(Y_t[0] - predicted);
+
+                if (distance < min_distance) {
+                    min_distance = distance;
+                    detected_dsm_str = table_entry.second;
+                    detected_qpsk_bits = make_pair(q1, q2);
+                }
+            }
+        }
+    }
+
+    prev_rx_signal = Y_t[0];
+
+    // Convert detected bits back to array
+    for (int i = 0; i < DSM_BITS; i++) {
+        detected_bits[i] = (detected_dsm_str[i] == '1') ? 1 : 0;
+    }
+    detected_bits[DSM_BITS] = detected_qpsk_bits.first;
+    detected_bits[DSM_BITS + 1] = detected_qpsk_bits.second;
+
+    // Count bit errors
+    for (int i = 0; i < BITS_PER_SYMBOL; i++) {
+        if (transmitted_bits[i] != detected_bits[i]) {
+            biterrno++;
+        }
+        dsignal++;
+    }
+}
+
+int main()
+{
+    srand((unsigned)time(NULL));
+
+    // Initialize system components
+    generate_antenna_matrices();
+    initialize_improved_differential_table();
+    initial();
+
+    printf("Starting simulation...\n\n");
+    printf("SNR(dB)   Bit Error Rate         Errors      Total Bits\n");
+    printf("--------------------------------------------------------\n");
+
+    for (point = 0; point < POINTNO; point++) {
+        snrdb = DB0 + point * DBSTEP;
+        snr = pow(10.0, 0.1 * snrdb);
+        deviate = sqrt(0.5 / snr);
+        biterrno = 0;
+        errlevel = ERRNOSTEP;
+        dsignal = 0;
+        
+        // ===== Reset state for each SNR point =====
+        S_prev = initialize_identity_matrix(NT);  // Reset S(t-1) = I
+        is_first_symbol = true;
+        prev_rx_signal = complex<double>(0.0, 0.0);
+
+        while (biterrno < MAXERRNO) {
+            if (biterrno > errlevel) {
+                errlevel += ERRNOSTEP;
+            }
+
+            for (samp = 0; samp < SAMPLE_NUM; samp++) {
+                differential_dsm_qpsk_transmit_receive();
+            }
+        }
+
+        record();
+        printf("%5.2f     %18.16f     %7d     %11u\n",
+            snrdb, (double)biterrno / dsignal, biterrno, dsignal);
+    }
+
+    printf("\n========================================================\n");
+    printf("  Simulation Complete\n");
+    printf("========================================================\n");
+    printf("Results saved to: %s\n\n", filename);
+    
+    system("pause");
+    return 0;
+}
